@@ -3,6 +3,11 @@
 #define LED_BLINK_PIN GPIO_NUM_48
 #define SDA_PIN GPIO_NUM_11
 #define SCL_PIN GPIO_NUM_12
+#define LIGHT_SENSOR_PIN GPIO_NUM_6
+
+#define FAN_CHANNEL 0
+#define FAN_FREQ 25000 // 25kHz frequency for fan control
+#define FAN_RESOLUTION 8 // 8-bit resolution for PWM
 
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
@@ -24,9 +29,16 @@ constexpr char LED_STATE_ATTR[] = "ledState";
 constexpr char FAN_STATE_ATTR[] = "fanState";
 constexpr char LED_BLINK_ATTR[] = "ledBlink";
 
+constexpr int LOW_LIGHT_THRESHOLD = 700; 
+constexpr int HIGHT_LIGHT_THRESHOLD = 1300; 
+constexpr int LOW_TEMP_THRESHOLD = 25; // Turn off fan
+constexpr int HIGH_TEMP_THRESHOLD = 30; // Turn on fan
+
 volatile bool ledState = false; 
 volatile bool fanState = false;
 volatile bool ledBlink = false;
+volatile bool ledManualControl = false; 
+volatile bool fanManualControl = false; 
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
@@ -40,40 +52,83 @@ constexpr std::array<const char *, 4U> SHARED_ATTRIBUTES_LIST = {
     LED_BLINK_ATTR
 };
 
+void setFanSpeed(int speed) {
+    if (fanState) {
+        speed = constrain(speed, 0, 255);
+        ledcWrite(FAN_CHANNEL, speed);
+        Serial.printf("Fan speed set to: %d\n", speed);
+    } else {
+        ledcWrite(FAN_CHANNEL, 0);
+        Serial.println("Fan is OFF, speed set to 0");
+    }
+}
+
 RPC_Response setLedSwitchState(const RPC_Data &data) {
     Serial.println("Received Switch state");
-    bool newState = data;
+    ledState = data;
     Serial.print("Switch state change: ");
-    Serial.println(newState);
-    digitalWrite(LED_PIN, newState);
-    tb.sendAttributeData(LED_STATE_ATTR, newState ? "ON" : "OFF");
-    return RPC_Response("setLedSwitchValue", newState);
+    Serial.println(ledState);
+    
+    int lightValue = analogRead(LIGHT_SENSOR_PIN);
+
+    //RPC and sensor both want to turn on/off the light, so control is returned to the sensor.
+    if ((ledState && lightValue < LOW_LIGHT_THRESHOLD) || 
+        (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD)) {
+        ledManualControl = false; 
+    } else ledManualControl = true;
+
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    tb.sendAttributeData(LED_STATE_ATTR, ledState ? "ON" : "OFF");
+    return RPC_Response("setLedSwitchValue", ledState);
 }
 
 RPC_Response setFanSwitchState(const RPC_Data &data) {
     Serial.println("Received Switch state");
-    bool newState = data;
+    fanState = data;
     Serial.print("Switch state change: ");
-    Serial.println(newState);
-    digitalWrite(FAN_PIN, newState);
-    tb.sendAttributeData(FAN_STATE_ATTR, newState ? "ON" : "OFF");
-    return RPC_Response("setFanSwitchValue", newState);
+    Serial.println(fanState);
+
+    dht20.read();
+    float temperature = dht20.getTemperature();
+
+    if ((fanState && temperature > HIGH_TEMP_THRESHOLD) ||
+        (!fanState && temperature < LOW_TEMP_THRESHOLD)) {
+        fanManualControl = false;
+    } else {
+        fanManualControl = true;
+    }
+
+    // If fan is turned on, set speed to maximum (255). If fan is turned off, set speed to 0
+    setFanSpeed(fanState ? 255 : 0);
+    tb.sendAttributeData(FAN_STATE_ATTR, fanState ? "ON" : "OFF");
+    return RPC_Response("setFanSwitchValue", fanState);
+}
+
+RPC_Response setFanSpeedValue(const RPC_Data &data) {
+    if (!fanManualControl) {
+        Serial.println("Fan is in automatic mode, cannot set speed via RPC.");
+        return RPC_Response("error", "Fan is in automatic mode, cannot set speed.");
+    }
+
+    int speed = data;
+    setFanSpeed(speed);
+    return RPC_Response("setFanSpeedValue", speed);
 }
 
 RPC_Response setLedBlinkState(const RPC_Data &data) {
     Serial.println("Received LED blink state");
-    bool newState = data;
-    ledBlink = newState;
+    ledBlink = data;
     Serial.print("LED blink state change: ");
-    Serial.println(newState);
-    tb.sendAttributeData(LED_BLINK_ATTR, newState ? "ON" : "OFF");
-    return RPC_Response("setLedBlinkValue", newState);
+    Serial.println(ledBlink);
+    tb.sendAttributeData(LED_BLINK_ATTR, ledBlink ? "ON" : "OFF");
+    return RPC_Response("setLedBlinkValue", ledBlink);
 }
 
-const std::array<RPC_Callback, 3U> callbacks = {
+const std::array<RPC_Callback, 4U> callbacks = {
     RPC_Callback{ "setLedSwitchValue", setLedSwitchState },
     RPC_Callback{ "setFanSwitchValue", setFanSwitchState },
-    RPC_Callback{ "setLedBlinkValue", setLedBlinkState }
+    RPC_Callback{ "setLedBlinkValue", setLedBlinkState },
+    RPC_Callback{ "setFanSpeed", setFanSpeedValue }
 };
 
 void processSharedAttributes(const Shared_Attribute_Data &data) {
@@ -164,6 +219,7 @@ void TaskBlinkLed(void *pvParameters) {
                 if (!ledBlink) break;
                 vTaskDelay(10 / portTICK_PERIOD_MS);
             }
+
             digitalWrite(LED_BLINK_PIN, LOW);
             for (int i = 0; i < 50; i++) {
                 if (!ledBlink) break;
@@ -178,6 +234,7 @@ void TaskBlinkLed(void *pvParameters) {
 
 void TaskSendTelemetry(void *pvParameters) {
     while (1) {
+        // Read temperature and humidity from DHT20 sensor
         dht20.read();
         float temperature = dht20.getTemperature();
         float humidity = dht20.getHumidity();
@@ -188,6 +245,66 @@ void TaskSendTelemetry(void *pvParameters) {
             tb.sendTelemetryData("humidity", humidity);
         } else {
             Serial.println("Failed to read from DHT sensor!");
+        }
+        // Read light sensor value
+        int lightValue = analogRead(LIGHT_SENSOR_PIN);
+        if (lightValue < 0 || lightValue > 4095) {
+            Serial.println("Invalid light sensor value!");
+        } else {
+            Serial.printf("Light Sensor Value: %d\n", lightValue);
+            tb.sendTelemetryData("lightSensor", lightValue);
+        }
+
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+}
+
+void TaskAutoLedControl(void *pvParameters) {
+    while (1) {
+        int lightValue = analogRead(LIGHT_SENSOR_PIN);
+
+        if ((ledState && lightValue < LOW_LIGHT_THRESHOLD) || 
+        (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD)) {
+            ledManualControl = false; 
+        }
+
+        if (!ledManualControl) {
+            if (lightValue < LOW_LIGHT_THRESHOLD) {
+                ledState = true;
+                Serial.println("LED turned ON due to low light");
+            } else if (lightValue > HIGHT_LIGHT_THRESHOLD) {
+                ledState = false;
+                Serial.println("LED turned OFF due to sufficient light");
+            }
+            digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+            tb.sendAttributeData(LED_STATE_ATTR, ledState ? "ON" : "OFF");
+        }
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+}
+
+void TaskAutoFanControl(void *pvParameters) {
+    while (1) {
+        dht20.read();
+        float temperature = dht20.getTemperature();
+        
+        if (!isnan(temperature)) {
+            if ((fanState && temperature > HIGH_TEMP_THRESHOLD) || 
+                (!fanState && temperature < LOW_TEMP_THRESHOLD)) {
+                fanManualControl = false; 
+            }
+
+            if (!fanManualControl) {
+                if (temperature > HIGH_TEMP_THRESHOLD) {
+                    fanState = true;
+                    Serial.println("Fan turned ON due to high temperature");
+                } else if (temperature < LOW_TEMP_THRESHOLD) {
+                    fanState = false;
+                    Serial.println("Fan turned OFF due to low temperature");
+                }
+                setFanSpeed(fanState ? 255 : 0);
+                tb.sendAttributeData(FAN_STATE_ATTR, fanState ? "ON" : "OFF");
+            }
         }
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
@@ -201,13 +318,15 @@ void TaskThingsBoardLoop(void *pvParameters) {
     }
 }
 
-
 void setup() {
     Serial.begin(SERIAL_DEBUG_BAUD);
-
     InitWiFi();
     pinMode(LED_PIN, OUTPUT);
+
     pinMode(FAN_PIN, OUTPUT);
+    ledcSetup(FAN_CHANNEL, FAN_FREQ, FAN_RESOLUTION);
+    ledcAttachPin(FAN_PIN, FAN_CHANNEL);
+
     pinMode(LED_BLINK_PIN, OUTPUT);
     Wire.begin(SDA_PIN, SCL_PIN);
     dht20.begin();
@@ -216,6 +335,8 @@ void setup() {
     xTaskCreate(TaskCoreIOTConnect, "CoreIOTConnect", 4096, NULL, 1, NULL);
     xTaskCreate(TaskBlinkLed, "BlinkLed", 4096, NULL, 1, NULL);
     xTaskCreate(TaskSendTelemetry, "SendTelemetry", 4096, NULL, 1, NULL);
+    xTaskCreate(TaskAutoLedControl, "AutoLedControl", 4096, NULL, 1, NULL);
+    xTaskCreate(TaskAutoFanControl, "AutoFanControl", 4096, NULL, 1, NULL);
     xTaskCreate(TaskThingsBoardLoop, "ThingsBoardLoop", 4096, NULL, 1, NULL);
 }
 
