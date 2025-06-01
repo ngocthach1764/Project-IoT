@@ -4,6 +4,10 @@
 #define SDA_PIN GPIO_NUM_11
 #define SCL_PIN GPIO_NUM_12
 #define LIGHT_SENSOR_PIN GPIO_NUM_6
+#define BUTTON_LED_PIN GPIO_NUM_8
+#define BUTTON_FAN_PIN GPIO_NUM_9
+#define LED_RGB_PIN GPIO_NUM_10
+#define NUM_LED_RGB 4
 
 #define FAN_CHANNEL 0
 #define FAN_FREQ 25000 // 25kHz frequency for fan control
@@ -16,6 +20,9 @@
 #include "Wire.h"
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <Button.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_NeoPixel.h>
 
 constexpr char WIFI_SSID[] = "Pnt";
 constexpr char WIFI_PASSWORD[] = "123456789";
@@ -32,19 +39,26 @@ constexpr char LED_BLINK_ATTR[] = "ledBlink";
 constexpr int LOW_LIGHT_THRESHOLD = 700; 
 constexpr int HIGHT_LIGHT_THRESHOLD = 1300; 
 constexpr int LOW_TEMP_THRESHOLD = 25; // Turn off fan
-constexpr int HIGH_TEMP_THRESHOLD = 30; // Turn on fan
+constexpr int HIGH_TEMP_THRESHOLD = 34; // Turn on fan
+
+constexpr uint8_t ButtonPins[] = { BUTTON_LED_PIN, BUTTON_FAN_PIN };
 
 volatile bool ledState = false; 
 volatile bool fanState = false;
 volatile bool ledBlink = false;
 volatile bool ledManualControl = false; 
 volatile bool fanManualControl = false; 
+volatile int currentFanSpeed = 0; 
+volatile bool fanSpeedControlEnabled = false;
+volatile bool buttonLedLastState = HIGH;
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
 ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
 
 DHT20 dht20;
+LiquidCrystal_I2C lcd(0x21, 16, 2);
+Adafruit_NeoPixel ledRGB(NUM_LED_RGB, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 constexpr std::array<const char *, 4U> SHARED_ATTRIBUTES_LIST = {
     LED_STATE_ATTR,
@@ -55,12 +69,25 @@ constexpr std::array<const char *, 4U> SHARED_ATTRIBUTES_LIST = {
 void setFanSpeed(int speed) {
     if (fanState) {
         speed = constrain(speed, 0, 255);
+        currentFanSpeed = speed;
         ledcWrite(FAN_CHANNEL, speed);
-        Serial.printf("Fan speed set to: %d\n", speed);
     } else {
+        currentFanSpeed = 0;
         ledcWrite(FAN_CHANNEL, 0);
-        Serial.println("Fan is OFF, speed set to 0");
     }
+}
+
+void setLedRGBColor(uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < NUM_LED_RGB; i++) {
+        ledRGB.setPixelColor(i, ledRGB.Color(r, g, b));
+    }
+    ledRGB.show();
+}
+
+void updateLedRGB(float temperature) {
+    if (temperature < 25) setLedRGBColor(0, 0, 255);
+    else if (temperature > 30) setLedRGBColor(255, 0, 0);
+    else setLedRGBColor(255, 255, 0);
 }
 
 RPC_Response setLedSwitchState(const RPC_Data &data) {
@@ -73,7 +100,8 @@ RPC_Response setLedSwitchState(const RPC_Data &data) {
 
     //RPC and sensor both want to turn on/off the light, so control is returned to the sensor.
     if ((ledState && lightValue < LOW_LIGHT_THRESHOLD) || 
-        (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD)) {
+        (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD) ||
+        (ledManualControl && lightValue >= LOW_LIGHT_THRESHOLD && lightValue <= HIGHT_LIGHT_THRESHOLD)) {
         ledManualControl = false; 
     } else ledManualControl = true;
 
@@ -91,27 +119,26 @@ RPC_Response setFanSwitchState(const RPC_Data &data) {
     dht20.read();
     float temperature = dht20.getTemperature();
 
+    // RPC and sensor both want to turn on/off the fan, so control is returned to the sensor.
     if ((fanState && temperature > HIGH_TEMP_THRESHOLD) ||
-        (!fanState && temperature < LOW_TEMP_THRESHOLD)) {
+        (!fanState && temperature < LOW_TEMP_THRESHOLD) ||
+        (fanManualControl && temperature >= LOW_TEMP_THRESHOLD && temperature <= HIGH_TEMP_THRESHOLD)) {
         fanManualControl = false;
-    } else {
-        fanManualControl = true;
-    }
+    } else fanManualControl = true;
 
-    // If fan is turned on, set speed to maximum (255). If fan is turned off, set speed to 0
-    setFanSpeed(fanState ? 255 : 0);
+    if (currentFanSpeed > 0) setFanSpeed(fanState ? currentFanSpeed : 0);
+    else setFanSpeed(fanState ? 255 : 0);
+    
     tb.sendAttributeData(FAN_STATE_ATTR, fanState ? "ON" : "OFF");
     return RPC_Response("setFanSwitchValue", fanState);
 }
 
 RPC_Response setFanSpeedValue(const RPC_Data &data) {
-    if (!fanManualControl) {
-        Serial.println("Fan is in automatic mode, cannot set speed via RPC.");
-        return RPC_Response("error", "Fan is in automatic mode, cannot set speed.");
-    }
-
     int speed = data;
-    setFanSpeed(speed);
+    if (fanState) {
+        setFanSpeed(speed);
+        fanSpeedControlEnabled = true;
+    }
     return RPC_Response("setFanSpeedValue", speed);
 }
 
@@ -154,7 +181,7 @@ void processSharedAttributes(const Shared_Attribute_Data &data) {
 const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
 const Attribute_Request_Callback attribute_shared_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
 
-void InitWiFi() {
+void initWiFi() {
     Serial.println("Connecting to WiFi...");
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     while (WiFi.status() != WL_CONNECTED) {
@@ -164,18 +191,25 @@ void InitWiFi() {
     Serial.println("WiFi Connected!");
 }
 
-void TaskWiFiConnect(void *pvParameters) {
+void taskWiFiConnect(void *pvParameters) {
     while (1) {
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("Reconnecting to WiFi...");
             WiFi.disconnect();
-            InitWiFi();
+            initWiFi();
+
+            // Send WiFi connection details to ThingsBoard
+            tb.sendAttributeData("rssi", WiFi.RSSI());
+            tb.sendAttributeData("channel", WiFi.channel());
+            tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+            tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+            tb.sendAttributeData("ssid", WiFi.SSID().c_str());
         }
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
 }
 
-void TaskCoreIOTConnect(void *pvParameters) {
+void taskCoreIOTConnect(void *pvParameters) {
     while (1) {
         if (!tb.connected()) {
             Serial.println("Connecting to CoreIOT...");
@@ -211,7 +245,7 @@ void TaskCoreIOTConnect(void *pvParameters) {
     }
 }
 
-void TaskBlinkLed(void *pvParameters) {
+void taskBlinkLed(void *pvParameters) {
     while (1) {
         if (ledBlink) {
             digitalWrite(LED_BLINK_PIN, HIGH);
@@ -232,7 +266,7 @@ void TaskBlinkLed(void *pvParameters) {
     }
 }
 
-void TaskSendTelemetry(void *pvParameters) {
+void taskSendTelemetry(void *pvParameters) {
     while (1) {
         // Read temperature and humidity from DHT20 sensor
         dht20.read();
@@ -243,9 +277,12 @@ void TaskSendTelemetry(void *pvParameters) {
             Serial.printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
             tb.sendTelemetryData("temperature", temperature);
             tb.sendTelemetryData("humidity", humidity);
+
+            updateLedRGB(temperature); // Update LED RGB color based on temperature
         } else {
             Serial.println("Failed to read from DHT sensor!");
         }
+
         // Read light sensor value
         int lightValue = analogRead(LIGHT_SENSOR_PIN);
         if (lightValue < 0 || lightValue > 4095) {
@@ -255,16 +292,31 @@ void TaskSendTelemetry(void *pvParameters) {
             tb.sendTelemetryData("lightSensor", lightValue);
         }
 
+        // Send fan speed telemetry
+        if (fanState) {
+            tb.sendTelemetryData("fanSpeed", currentFanSpeed);
+            Serial.printf("Fan Speed: %d\n", currentFanSpeed);
+        } else {
+            tb.sendTelemetryData("fanSpeed", 0);
+            Serial.println("Fan is OFF, speed set to 0");
+        }
+
+        // Send location telemetry data
+        double latitude = 10.880018410410052;
+        double longitude = 106.80633605864662;
+        tb.sendTelemetryData("latitude", latitude);
+        tb.sendTelemetryData("longitude", longitude);
+
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
 }
 
-void TaskAutoLedControl(void *pvParameters) {
+void taskAutoLedControl(void *pvParameters) {
     while (1) {
         int lightValue = analogRead(LIGHT_SENSOR_PIN);
 
         if ((ledState && lightValue < LOW_LIGHT_THRESHOLD) || 
-        (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD)) {
+            (!ledState && lightValue > HIGHT_LIGHT_THRESHOLD)) {
             ledManualControl = false; 
         }
 
@@ -283,26 +335,36 @@ void TaskAutoLedControl(void *pvParameters) {
     }
 }
 
-void TaskAutoFanControl(void *pvParameters) {
+void taskAutoFanControl(void *pvParameters) {
     while (1) {
         dht20.read();
         float temperature = dht20.getTemperature();
         
         if (!isnan(temperature)) {
             if ((fanState && temperature > HIGH_TEMP_THRESHOLD) || 
-                (!fanState && temperature < LOW_TEMP_THRESHOLD)) {
+                (!fanState && temperature < LOW_TEMP_THRESHOLD) ||
+                (fanManualControl && temperature >= LOW_TEMP_THRESHOLD && temperature <= HIGH_TEMP_THRESHOLD)) {
                 fanManualControl = false; 
             }
+
+            if (!fanState) fanSpeedControlEnabled = false;
 
             if (!fanManualControl) {
                 if (temperature > HIGH_TEMP_THRESHOLD) {
                     fanState = true;
                     Serial.println("Fan turned ON due to high temperature");
+                    if (fanSpeedControlEnabled) {
+                        setFanSpeed(currentFanSpeed);
+                    } else {
+                        setFanSpeed(255); 
+                    }
                 } else if (temperature < LOW_TEMP_THRESHOLD) {
-                    fanState = false;
+                    fanState = false; 
                     Serial.println("Fan turned OFF due to low temperature");
+                    fanSpeedControlEnabled = false;
+                    setFanSpeed(0);
                 }
-                setFanSpeed(fanState ? 255 : 0);
+
                 tb.sendAttributeData(FAN_STATE_ATTR, fanState ? "ON" : "OFF");
             }
         }
@@ -310,7 +372,90 @@ void TaskAutoFanControl(void *pvParameters) {
     }
 }
 
-void TaskThingsBoardLoop(void *pvParameters) {
+void taskReadButton(void *pvParameters) {
+    while (1) {
+        getKeyInput();
+
+        if (isButtonPressed(0)) {
+            Serial.println("Button LED pressed!");
+            ledState = !ledState;
+            ledManualControl = true;
+            digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+            tb.sendAttributeData(LED_STATE_ATTR, ledState ? "ON" : "OFF");
+        }
+
+        if (isButtonPressed(1)) {
+            Serial.println("Button FAN pressed!");
+            fanState = !fanState;
+            fanManualControl = true;
+            setFanSpeed(fanState ? 255 : 0);
+            tb.sendAttributeData(FAN_STATE_ATTR, fanState ? "ON" : "OFF");
+        }
+
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+
+void taskLCDDisplay(void *pvParameters) {
+    int screen = 0;
+    const char* schoolName = "HCMUT";
+    const char* classroomName = "H6-105";
+    int totalStudents = 32;
+    int absentStudents = 0;
+
+    while (1) {
+        lcd.clear();
+        switch (screen) {
+            case 0:
+                lcd.setCursor(0, 0);
+                lcd.print("School: ");
+                lcd.print(schoolName);
+                lcd.setCursor(0, 1);
+                lcd.print("Class: ");
+                lcd.print(classroomName);
+                break;
+            case 1:
+                lcd.setCursor(0, 0);
+                lcd.print("Students: ");
+                lcd.print(totalStudents);
+                lcd.setCursor(0, 1);       
+                lcd.print("Absent: ");
+                lcd.print(absentStudents);
+                break;
+            case 2: {
+                dht20.read();  
+                float temperature = dht20.getTemperature();
+                float humidity = dht20.getHumidity();
+
+                lcd.setCursor(0, 0);
+                lcd.print("Temp: ");
+                lcd.print(temperature, 2);
+                lcd.print(" C");
+                lcd.setCursor(0, 1);
+                lcd.print("Hum: ");
+                lcd.print(humidity, 2);
+                lcd.print(" % ");
+                break;
+            }
+            case 3: {
+                lcd.setCursor(0, 0);
+                lcd.print("Light: ");
+                int lightValue = analogRead(LIGHT_SENSOR_PIN);
+                lcd.print(lightValue);
+                lcd.print(" ADC");
+                lcd.setCursor(0, 1);
+                lcd.print("Fan Speed: ");
+                lcd.print(currentFanSpeed);
+                break;
+            }
+        }
+        screen = (screen + 1) % 4;
+        vTaskDelay(4000 / portTICK_PERIOD_MS);  
+    }
+}
+
+
+void taskThingsBoardLoop(void *pvParameters) {
     while (1) {
         tb.loop();
         mqttClient.loop();
@@ -320,7 +465,7 @@ void TaskThingsBoardLoop(void *pvParameters) {
 
 void setup() {
     Serial.begin(SERIAL_DEBUG_BAUD);
-    InitWiFi();
+    initWiFi();
     pinMode(LED_PIN, OUTPUT);
 
     pinMode(FAN_PIN, OUTPUT);
@@ -331,13 +476,26 @@ void setup() {
     Wire.begin(SDA_PIN, SCL_PIN);
     dht20.begin();
 
-    xTaskCreate(TaskWiFiConnect, "WiFiConnect", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskCoreIOTConnect, "CoreIOTConnect", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskBlinkLed, "BlinkLed", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskSendTelemetry, "SendTelemetry", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskAutoLedControl, "AutoLedControl", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskAutoFanControl, "AutoFanControl", 4096, NULL, 1, NULL);
-    xTaskCreate(TaskThingsBoardLoop, "ThingsBoardLoop", 4096, NULL, 1, NULL);
+    buttonInit(ButtonPins, sizeof(ButtonPins) / sizeof(ButtonPins[0]));
+
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("LCD Ready!");
+
+    ledRGB.begin();
+    ledRGB.show();
+
+    xTaskCreate(taskWiFiConnect, "WiFiConnect", 4096, NULL, 1, NULL);
+    xTaskCreate(taskCoreIOTConnect, "CoreIOTConnect", 4096, NULL, 1, NULL);
+    xTaskCreate(taskBlinkLed, "BlinkLed", 4096, NULL, 1, NULL);
+    xTaskCreate(taskSendTelemetry, "SendTelemetry", 4096, NULL, 1, NULL);
+    xTaskCreate(taskAutoLedControl, "AutoLedControl", 4096, NULL, 1, NULL);
+    xTaskCreate(taskAutoFanControl, "AutoFanControl", 4096, NULL, 1, NULL);
+    xTaskCreate(taskReadButton, "ReadButton", 4096, NULL, 1, NULL);
+    xTaskCreate(taskLCDDisplay, "LCDDisplay", 4096, NULL, 1, NULL);
+    xTaskCreate(taskThingsBoardLoop, "ThingsBoardLoop", 4096, NULL, 1, NULL);
 }
 
 void loop() {
