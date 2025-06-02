@@ -8,10 +8,20 @@
 #define BUTTON_FAN_PIN GPIO_NUM_9
 #define LED_RGB_PIN GPIO_NUM_10
 #define NUM_LED_RGB 4
+#define MQ135_PIN GPIO_NUM_3
+#define MQ2_PIN GPIO_NUM_4
 
 #define FAN_CHANNEL 0
 #define FAN_FREQ 25000 // 25kHz frequency for fan control
 #define FAN_RESOLUTION 8 // 8-bit resolution for PWM
+
+#define BOARD "Yolo UNO ESP32-S3"
+#define VOLAYAGE_RESOLUTION 3.3 // 3.3V voltage resolution for ESP32
+#define ADC_BIT_RESOLUTION 12 // 12-bit ADC resolution for ESP32
+#define TYPE_MQ135 "MQ-135"
+#define RATIO_MQ135 3.6 // Ratio of the sensor resistance in clean air
+#define TYPE_MQ2 "MQ-2"
+#define RATIO_MQ2 9.83  // / Ratio of the sensor resistance in clean air
 
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
@@ -23,9 +33,10 @@
 #include <Button.h>
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_NeoPixel.h>
+#include <MQUnifiedsensor.h>
 
-constexpr char WIFI_SSID[] = "Pnt";
-constexpr char WIFI_PASSWORD[] = "123456789";
+constexpr char WIFI_SSID[] = "ACLAB";
+constexpr char WIFI_PASSWORD[] = "ACLAB2023";
 constexpr char TOKEN[] = "RGt6uINezgdb0Rwra6Um";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
@@ -59,8 +70,10 @@ ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
 DHT20 dht20;
 LiquidCrystal_I2C lcd(0x21, 16, 2);
 Adafruit_NeoPixel ledRGB(NUM_LED_RGB, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
+MQUnifiedsensor MQ135(BOARD, VOLAYAGE_RESOLUTION, ADC_BIT_RESOLUTION, MQ135_PIN, TYPE_MQ135);
+MQUnifiedsensor MQ2(BOARD, VOLAYAGE_RESOLUTION, ADC_BIT_RESOLUTION, MQ2_PIN, TYPE_MQ2);
 
-constexpr std::array<const char *, 4U> SHARED_ATTRIBUTES_LIST = {
+constexpr std::array<const char *, 3U> SHARED_ATTRIBUTES_LIST = {
     LED_STATE_ATTR,
     FAN_STATE_ATTR,
     LED_BLINK_ATTR
@@ -88,6 +101,66 @@ void updateLedRGB(float temperature) {
     if (temperature < 25) setLedRGBColor(0, 0, 255);
     else if (temperature > 30) setLedRGBColor(255, 0, 0);
     else setLedRGBColor(255, 255, 0);
+}
+
+void setupGasMQ135(float a, float b) {
+    MQ135.setRegressionMethod(1); //_PPM = a * ratio^b
+    MQ135.setA(a); 
+    MQ135.setB(b);
+}
+
+void setupGasMQ2(float a, float b) {
+    MQ2.setRegressionMethod(1); 
+    MQ2.setA(a);
+    MQ2.setB(b);
+}
+
+void calibrateSensorMQ135() {
+    Serial.print("Calibrating MQ135...");
+    float calcR0 = 0;
+    for (int i = 0; i < 10; i++) {
+        MQ135.update();
+        calcR0 += MQ135.calibrate(RATIO_MQ135);
+        Serial.print(".");
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    MQ135.setR0(calcR0 / 10);
+    Serial.println(" done!");
+
+    if (isinf(calcR0)) {
+        Serial.println("Warning: R0 is infinite! Check wiring.");
+        while (1) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+    }
+    if (calcR0 == 0) {
+        Serial.println("Warning: R0 is zero! Check wiring.");
+        while (1) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+    }
+
+    MQ135.serialDebug(true);
+}
+
+void calibrateSensorMQ2() {
+    Serial.print("Calibrating MQ2...");
+    float calcR0 = 0;
+    for (int i = 0; i < 10; i++) {
+        MQ2.update();
+        calcR0 += MQ2.calibrate(RATIO_MQ2);
+        Serial.print(".");
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    MQ2.setR0(calcR0 / 10);
+    Serial.println(" done!");
+
+    if (isinf(calcR0)) {
+        Serial.println("Warning: R0 is infinite! Check wiring.");
+        while (1) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+    }
+    if (calcR0 == 0) {
+        Serial.println("Warning: R0 is zero! Check wiring.");
+        while (1) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+    }
+
+    MQ2.serialDebug(true);
 }
 
 RPC_Response setLedSwitchState(const RPC_Data &data) {
@@ -301,6 +374,83 @@ void taskSendTelemetry(void *pvParameters) {
             Serial.println("Fan is OFF, speed set to 0");
         }
 
+        // read CO from MQ135 sensor
+        setupGasMQ135(605.18, -3.937);
+        MQ135.update();
+        float ppmCO_MQ135 = MQ135.readSensor();
+        Serial.printf("CO PPM from MQ135 sensor: %.2f\n", ppmCO_MQ135);
+        tb.sendTelemetryData("ppmCO_MQ135", ppmCO_MQ135);
+
+        // read CO2 from MQ135 sensor
+        setupGasMQ135(110.47, -2.862);
+        MQ135.update();
+        float ppmCO2 = MQ135.readSensor();
+        Serial.printf("CO2 PPM: %.2f\n", ppmCO2);      
+        tb.sendTelemetryData("ppmCO2", ppmCO2);
+
+        // read NH4 from MQ135 sensor
+        setupGasMQ135(102.2, -2.473);
+        MQ135.update();
+        float ppmNH4 = MQ135.readSensor();
+        Serial.printf("NH4 PPM: %.2f\n", ppmNH4);
+        tb.sendTelemetryData("ppmNH4", ppmNH4);
+
+        // read Alcohol from MQ135 sensor
+        setupGasMQ135(77.255, -3.18);
+        MQ135.update();         
+        float ppmAlcohol_MQ135 = MQ135.readSensor();
+        Serial.printf("Alcohol PPM from MQ135 sensor: %.2f\n", ppmAlcohol_MQ135);
+        tb.sendTelemetryData("ppmAlcohol_MQ135", ppmAlcohol_MQ135);
+
+        // read Toluene from MQ135 sensor
+        setupGasMQ135(44.947, -3.445);
+        MQ135.update();
+        float ppmToluene = MQ135.readSensor();
+        Serial.printf("Toluene PPM: %.2f\n", ppmToluene);
+        tb.sendTelemetryData("ppmToluene", ppmToluene);
+
+        // read Acetone from MQ135 sensor
+        setupGasMQ135(34.668, -3.369);
+        MQ135.update();
+        float ppmAcetone = MQ135.readSensor();
+        Serial.printf("Acetone PPM: %.2f\n", ppmAcetone);
+        tb.sendTelemetryData("ppmAcetone", ppmAcetone);
+
+        // read H2 from MQ2 sensor
+        setupGasMQ2(987.99, -2.162);
+        MQ2.update();
+        float ppmH2 = MQ2.readSensor();
+        Serial.printf("H2 PPM: %.2f\n", ppmH2);
+        tb.sendTelemetryData("ppmH2", ppmH2);
+
+        // read LPG from MQ2 sensor
+        setupGasMQ2(574.25, -2.222);
+        MQ2.update();
+        float ppmLPG = MQ2.readSensor();
+        Serial.printf("LPG PPM: %.2f\n", ppmLPG);   
+        tb.sendTelemetryData("ppmLPG", ppmLPG);
+
+        // read CO from MQ2 sensor
+        setupGasMQ2(36974, -3.109);
+        MQ2.update();
+        float ppmCO_MQ2 = MQ2.readSensor();
+        Serial.printf("CO PPM from MQ2 sensor: %.2f\n", ppmCO_MQ2);
+        tb.sendTelemetryData("ppmCO_MQ2", ppmCO_MQ2);
+
+        // read Alcohol from MQ2 sensor
+        setupGasMQ2(3616.1, -2.675);
+        MQ2.update();
+        float ppmAlcohol_MQ2 = MQ2.readSensor();
+        Serial.printf("Alcohol PPM from MQ2 sensor: %.2f\n", ppmAlcohol_MQ2);
+        tb.sendTelemetryData("ppmAlcohol_MQ2", ppmAlcohol_MQ2);
+
+        // read Propane from MQ2 sensor
+        setupGasMQ2(658.71, -2.168);
+        MQ2.update();
+        float ppmPropane = MQ2.readSensor();
+        Serial.printf("Propane PPM: %.2f\n", ppmPropane);
+        tb.sendTelemetryData("ppmPropane", ppmPropane);
+
         // Send location telemetry data
         double latitude = 10.880018410410052;
         double longitude = 106.80633605864662;
@@ -486,6 +636,12 @@ void setup() {
 
     ledRGB.begin();
     ledRGB.show();
+
+    MQ135.init();
+    calibrateSensorMQ135();
+
+    MQ2.init();
+    calibrateSensorMQ2();
 
     xTaskCreate(taskWiFiConnect, "WiFiConnect", 4096, NULL, 1, NULL);
     xTaskCreate(taskCoreIOTConnect, "CoreIOTConnect", 4096, NULL, 1, NULL);
