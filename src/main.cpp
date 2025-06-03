@@ -50,7 +50,17 @@ constexpr char LED_BLINK_ATTR[] = "ledBlink";
 constexpr int LOW_LIGHT_THRESHOLD = 700; 
 constexpr int HIGHT_LIGHT_THRESHOLD = 1300; 
 constexpr int LOW_TEMP_THRESHOLD = 25; // Turn off fan
-constexpr int HIGH_TEMP_THRESHOLD = 34; // Turn on fan
+constexpr int HIGH_TEMP_THRESHOLD = 30; // Turn on fan
+
+constexpr int H2_PPM_THRESHOLD = 10000;
+constexpr int LPG_PPM_THRESHOLD = 300;  
+constexpr int CO_PPM_THRESHOLD = 9;      
+constexpr int ALCOHOL_PPM_THRESHOLD = 1000;
+constexpr int PROPANE_PPM_THRESHOLD = 300;
+constexpr int CO2_PPM_THRESHOLD = 1000;
+constexpr int NH4_PPM_THRESHOLD = 25;
+constexpr int ACETONE_PPM_THRESHOLD = 750;
+constexpr int TOLUENE_PPM_THRESHOLD = 100;
 
 constexpr uint8_t ButtonPins[] = { BUTTON_LED_PIN, BUTTON_FAN_PIN };
 
@@ -59,9 +69,10 @@ volatile bool fanState = false;
 volatile bool ledBlink = false;
 volatile bool ledManualControl = false; 
 volatile bool fanManualControl = false; 
+volatile bool ledBlinkManualControl = false;
 volatile int currentFanSpeed = 0; 
 volatile bool fanSpeedControlEnabled = false;
-volatile bool buttonLedLastState = HIGH;
+volatile bool airQuality = true; // Assume air quality is good initially
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
@@ -97,10 +108,9 @@ void setLedRGBColor(uint8_t r, uint8_t g, uint8_t b) {
     ledRGB.show();
 }
 
-void updateLedRGB(float temperature) {
-    if (temperature < 25) setLedRGBColor(0, 0, 255);
-    else if (temperature > 30) setLedRGBColor(255, 0, 0);
-    else setLedRGBColor(255, 255, 0);
+void updateLedRGB(bool airQuality) {
+    if (airQuality) setLedRGBColor(0, 255, 0);
+    else setLedRGBColor(255, 0, 0); 
 }
 
 void setupGasMQ135(float a, float b) {
@@ -220,6 +230,42 @@ RPC_Response setLedBlinkState(const RPC_Data &data) {
     ledBlink = data;
     Serial.print("LED blink state change: ");
     Serial.println(ledBlink);
+
+    // read H2 from MQ2 sensor
+    setupGasMQ2(987.99, -2.162);
+    MQ2.update();
+    float ppmH2 = MQ2.readSensor();
+
+    // read LPG from MQ2 sensor
+    setupGasMQ2(574.25, -2.222);
+    MQ2.update();
+    float ppmLPG = MQ2.readSensor();
+
+    // read CO from MQ2 sensor
+    setupGasMQ2(36974, -3.109);
+    MQ2.update();
+    float ppmCO_MQ2 = MQ2.readSensor();
+
+    // read Alcohol from MQ2 sensor
+    setupGasMQ2(3616.1, -2.675);
+    MQ2.update();
+    float ppmAlcohol_MQ2 = MQ2.readSensor();
+
+    // read Propane from MQ2 sensor
+    setupGasMQ2(658.71, -2.168);
+    MQ2.update();
+    float ppmPropane = MQ2.readSensor();
+
+    bool gasDetection = (ppmH2 > H2_PPM_THRESHOLD || ppmLPG > LPG_PPM_THRESHOLD ||
+                            ppmCO_MQ2 > CO_PPM_THRESHOLD || ppmAlcohol_MQ2 > ALCOHOL_PPM_THRESHOLD ||
+                            ppmPropane > PROPANE_PPM_THRESHOLD);
+    
+    // RPC and sensor both want to turn on/off the LED blink, so control is returned to the sensor.
+    if ((ledBlink && gasDetection)|| (!ledBlink && !gasDetection)) {
+        ledBlinkManualControl = false; 
+    } else ledBlinkManualControl = true; 
+    
+    tb.sendTelemetryData("gasDetection", ledBlink ? "Danger" : "Safe");
     tb.sendAttributeData(LED_BLINK_ATTR, ledBlink ? "ON" : "OFF");
     return RPC_Response("setLedBlinkValue", ledBlink);
 }
@@ -416,6 +462,15 @@ void taskSendTelemetry(void *pvParameters) {
         Serial.printf("Acetone PPM: %.2f\n", ppmAcetone);
         tb.sendTelemetryData("ppmAcetone", ppmAcetone);
 
+        // Check air quality 
+        airQuality = (ppmCO_MQ135 < CO_PPM_THRESHOLD && ppmCO2 < CO2_PPM_THRESHOLD &&
+                      ppmNH4 < NH4_PPM_THRESHOLD && ppmAlcohol_MQ135 < ALCOHOL_PPM_THRESHOLD &&
+                      ppmToluene < TOLUENE_PPM_THRESHOLD && ppmAcetone < ACETONE_PPM_THRESHOLD);
+        Serial.printf("Air Quality: %s\n", airQuality ? "Good" : "Bad");
+        tb.sendTelemetryData("airQuality", airQuality ? "Good" : "Bad");
+
+        updateLedRGB(airQuality);
+
         // read H2 from MQ2 sensor
         setupGasMQ2(987.99, -2.162);
         MQ2.update();
@@ -450,6 +505,27 @@ void taskSendTelemetry(void *pvParameters) {
         float ppmPropane = MQ2.readSensor();
         Serial.printf("Propane PPM: %.2f\n", ppmPropane);
         tb.sendTelemetryData("ppmPropane", ppmPropane);
+
+        // Check gas detection
+        bool gasDetection = (ppmH2 > H2_PPM_THRESHOLD || ppmLPG > LPG_PPM_THRESHOLD ||
+                             ppmCO_MQ2 > CO_PPM_THRESHOLD || ppmAlcohol_MQ2 > ALCOHOL_PPM_THRESHOLD ||
+                             ppmPropane > PROPANE_PPM_THRESHOLD);
+        
+        if ((ledBlink && gasDetection)|| (!ledBlink && !gasDetection)) {
+            ledBlinkManualControl = false; 
+        } 
+
+        if (!ledBlinkManualControl) {
+            if (gasDetection) {
+                ledBlink = true;
+                Serial.println("LED blink ON due to gas detection");
+            } else {
+                ledBlink = false;
+                Serial.println("LED blink OFF, no gas detected");
+            }
+            tb.sendTelemetryData("gasDetection", gasDetection ? "Danger" : "Safe");
+            tb.sendAttributeData(LED_BLINK_ATTR, ledBlink ? "ON" : "OFF");
+        }
 
         // Send location telemetry data
         double latitude = 10.880018410410052;
@@ -603,7 +679,6 @@ void taskLCDDisplay(void *pvParameters) {
         vTaskDelay(4000 / portTICK_PERIOD_MS);  
     }
 }
-
 
 void taskThingsBoardLoop(void *pvParameters) {
     while (1) {
