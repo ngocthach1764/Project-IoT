@@ -16,7 +16,7 @@
 #define FAN_RESOLUTION 8 // 8-bit resolution for PWM
 
 #define BOARD "Yolo UNO ESP32-S3"
-#define VOLAYAGE_RESOLUTION 3.3 // 3.3V voltage resolution for ESP32
+#define VOLAYAGE_RESOLUTION 5 // 5V voltage resolution for ESP32
 #define ADC_BIT_RESOLUTION 12 // 12-bit ADC resolution for ESP32
 #define TYPE_MQ135 "MQ-135"
 #define RATIO_MQ135 3.6 // Ratio of the sensor resistance in clean air
@@ -34,6 +34,9 @@
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_NeoPixel.h>
 #include <MQUnifiedsensor.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <Preferences.h>
 
 constexpr char WIFI_SSID[] = "ACLAB";
 constexpr char WIFI_PASSWORD[] = "ACLAB2023";
@@ -46,6 +49,9 @@ constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 constexpr char LED_STATE_ATTR[] = "ledState";
 constexpr char FAN_STATE_ATTR[] = "fanState";
 constexpr char LED_BLINK_ATTR[] = "ledBlink";
+constexpr char FIRMWARE_URL_ATTR[] = "fw_url";
+constexpr char FIRMWARE_VERSION_ATTR[] = "fw_version";
+constexpr char FIRMWARE_TITLE_ATTR[] = "fw_title";
 
 constexpr int LOW_LIGHT_THRESHOLD = 700; 
 constexpr int HIGHT_LIGHT_THRESHOLD = 1300; 
@@ -54,7 +60,7 @@ constexpr int HIGH_TEMP_THRESHOLD = 30; // Turn on fan
 
 constexpr int H2_PPM_THRESHOLD = 10000;
 constexpr int LPG_PPM_THRESHOLD = 300;  
-constexpr int CO_PPM_THRESHOLD = 9;      
+constexpr int CO_PPM_THRESHOLD = 35;      
 constexpr int ALCOHOL_PPM_THRESHOLD = 1000;
 constexpr int PROPANE_PPM_THRESHOLD = 300;
 constexpr int CO2_PPM_THRESHOLD = 1000;
@@ -74,6 +80,11 @@ volatile int currentFanSpeed = 0;
 volatile bool fanSpeedControlEnabled = false;
 volatile bool airQuality = true; // Assume air quality is good initially
 
+String firmwareUrl = "";
+String lastFirmwareUrl = ""; // Store the last firmware URL for OTA updates 
+
+std::vector<String> exceededGases; // List of gases that exceed thresholds
+
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
 ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
@@ -83,11 +94,15 @@ LiquidCrystal_I2C lcd(0x21, 16, 2);
 Adafruit_NeoPixel ledRGB(NUM_LED_RGB, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
 MQUnifiedsensor MQ135(BOARD, VOLAYAGE_RESOLUTION, ADC_BIT_RESOLUTION, MQ135_PIN, TYPE_MQ135);
 MQUnifiedsensor MQ2(BOARD, VOLAYAGE_RESOLUTION, ADC_BIT_RESOLUTION, MQ2_PIN, TYPE_MQ2);
+Preferences preferences; // Preferences for storing firmware URL 
 
-constexpr std::array<const char *, 3U> SHARED_ATTRIBUTES_LIST = {
+constexpr std::array<const char *, 6U> SHARED_ATTRIBUTES_LIST = {
     LED_STATE_ATTR,
     FAN_STATE_ATTR,
-    LED_BLINK_ATTR
+    LED_BLINK_ATTR,
+    FIRMWARE_URL_ATTR,
+    FIRMWARE_VERSION_ATTR,
+    FIRMWARE_TITLE_ATTR
 };
 
 void setFanSpeed(int speed) {
@@ -293,6 +308,18 @@ void processSharedAttributes(const Shared_Attribute_Data &data) {
             ledBlink = it->value().as<bool>();
             Serial.print("LED blink state is set to: ");
             Serial.println(ledBlink);
+        } else if (strcmp(it->key().c_str(), FIRMWARE_URL_ATTR) == 0) {
+            firmwareUrl = it->value().as<String>();
+            Serial.print("Firmware URL is set to: ");
+            Serial.println(firmwareUrl);
+        } else if (strcmp(it->key().c_str(), FIRMWARE_VERSION_ATTR) == 0) {
+            String firmwareVersion = it->value().as<String>();
+            Serial.print("Firmware version is set to: ");
+            Serial.println(firmwareVersion);
+        } else if (strcmp(it->key().c_str(), FIRMWARE_TITLE_ATTR) == 0) {
+            String firmwareTitle = it->value().as<String>();
+            Serial.print("Firmware title is set to: ");
+            Serial.println(firmwareTitle);
         }
     }
 }
@@ -527,6 +554,18 @@ void taskSendTelemetry(void *pvParameters) {
             tb.sendAttributeData(LED_BLINK_ATTR, ledBlink ? "ON" : "OFF");
         }
 
+        // Add gas to list if exceeded thresholds
+        exceededGases.clear();
+        if (ppmH2 > H2_PPM_THRESHOLD) exceededGases.push_back("H2");
+        if (ppmLPG > LPG_PPM_THRESHOLD) exceededGases.push_back("LPG");
+        if (ppmCO_MQ2 > CO_PPM_THRESHOLD || ppmCO_MQ135 > CO_PPM_THRESHOLD) exceededGases.push_back("CO");
+        if (ppmAlcohol_MQ2 > ALCOHOL_PPM_THRESHOLD || ppmAlcohol_MQ135 > ALCOHOL_PPM_THRESHOLD) exceededGases.push_back("Alcohol");
+        if (ppmPropane > PROPANE_PPM_THRESHOLD) exceededGases.push_back("Propane");
+        if (ppmCO2 > CO2_PPM_THRESHOLD) exceededGases.push_back("CO2");
+        if (ppmNH4 > NH4_PPM_THRESHOLD) exceededGases.push_back("NH4");
+        if (ppmAcetone > ACETONE_PPM_THRESHOLD) exceededGases.push_back("Acetone");
+        if (ppmToluene > TOLUENE_PPM_THRESHOLD) exceededGases.push_back("Toluene");
+
         // Send location telemetry data
         double latitude = 10.880018410410052;
         double longitude = 106.80633605864662;
@@ -629,56 +668,135 @@ void taskLCDDisplay(void *pvParameters) {
     int totalStudents = 32;
     int absentStudents = 0;
 
+    unsigned long lastGasDisplayTime = 0;
+    int gasDisplayIndex = 0;
+
     while (1) {
         lcd.clear();
-        switch (screen) {
-            case 0:
-                lcd.setCursor(0, 0);
-                lcd.print("School: ");
-                lcd.print(schoolName);
-                lcd.setCursor(0, 1);
-                lcd.print("Class: ");
-                lcd.print(classroomName);
-                break;
-            case 1:
-                lcd.setCursor(0, 0);
-                lcd.print("Students: ");
-                lcd.print(totalStudents);
-                lcd.setCursor(0, 1);       
-                lcd.print("Absent: ");
-                lcd.print(absentStudents);
-                break;
-            case 2: {
-                dht20.read();  
-                float temperature = dht20.getTemperature();
-                float humidity = dht20.getHumidity();
+        if (ledBlink && !exceededGases.empty()) {
+            lcd.setCursor(2, 0);
+            lcd.print("!! WARNING !!");
 
-                lcd.setCursor(0, 0);
-                lcd.print("Temp: ");
-                lcd.print(temperature, 2);
-                lcd.print(" C");
-                lcd.setCursor(0, 1);
-                lcd.print("Hum: ");
-                lcd.print(humidity, 2);
-                lcd.print(" % ");
-                break;
+            String gasName = exceededGases[gasDisplayIndex];
+            int padding = (16 - gasName.length()) / 2;
+            padding = max(padding, 0);
+            lcd.setCursor(padding, 1);
+            lcd.print(gasName);
+
+            if (millis() - lastGasDisplayTime >= 2000) {
+                gasDisplayIndex = (gasDisplayIndex + 1) % exceededGases.size();
+                lastGasDisplayTime = millis();
             }
-            case 3: {
-                lcd.setCursor(0, 0);
-                lcd.print("Light: ");
-                int lightValue = analogRead(LIGHT_SENSOR_PIN);
-                lcd.print(lightValue);
-                lcd.print(" ADC");
-                lcd.setCursor(0, 1);
-                lcd.print("Fan Speed: ");
-                lcd.print(currentFanSpeed);
-                break;
+        } else {
+            switch (screen) {
+                case 0:
+                    lcd.setCursor(0, 0);
+                    lcd.print("School: ");
+                    lcd.print(schoolName);
+                    lcd.setCursor(0, 1);
+                    lcd.print("Class: ");
+                    lcd.print(classroomName);
+                    break;
+                case 1:
+                    lcd.setCursor(0, 0);
+                    lcd.print("Students: ");
+                    lcd.print(totalStudents);
+                    lcd.setCursor(0, 1);       
+                    lcd.print("Absent: ");
+                    lcd.print(absentStudents);
+                    break;
+                case 2: {
+                    dht20.read();  
+                    float temperature = dht20.getTemperature();
+                    float humidity = dht20.getHumidity();
+
+                    lcd.setCursor(0, 0);
+                    lcd.print("Temp: ");
+                    lcd.print(temperature, 2);
+                    lcd.print(" C");
+                    lcd.setCursor(0, 1);
+                    lcd.print("Hum: ");
+                    lcd.print(humidity, 2);
+                    lcd.print(" % ");
+                    break;
+                }
+                case 3: {
+                    lcd.setCursor(0, 0);
+                    lcd.print("Light: ");
+                    int lightValue = analogRead(LIGHT_SENSOR_PIN);
+                    lcd.print(lightValue);
+                    lcd.print(" ADC");
+                    lcd.setCursor(0, 1);
+                    lcd.print("Fan Speed: ");
+                    lcd.print(currentFanSpeed);
+                    break;
+                }
             }
+            screen = (screen + 1) % 4;
+            vTaskDelay(4000 / portTICK_PERIOD_MS); 
+            continue;
         }
-        screen = (screen + 1) % 4;
-        vTaskDelay(4000 / portTICK_PERIOD_MS);  
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
+
+void taskOTAUpdate(void *pvParameters) {
+    while (1) {
+        if (firmwareUrl != "" && firmwareUrl != lastFirmwareUrl) {
+            Serial.println("Starting OTA Update from URL: " + firmwareUrl);
+
+            HTTPClient http;
+            http.begin(firmwareUrl);
+            int httpCode = http.GET();
+
+            if (httpCode == HTTP_CODE_OK) {
+                int contentLength = http.getSize();
+                WiFiClient *stream = http.getStreamPtr();
+
+                if (contentLength > 0) {
+                    bool canBegin = Update.begin(contentLength);
+                    if (canBegin) {
+                        size_t written = Update.writeStream(*stream);
+                        if (written == contentLength) {
+                            Serial.println("Firmware written successfully.");
+                        } else {
+                            Serial.printf("Written only %d/%d bytes.\n", (int)written, contentLength);
+                        }
+
+                        if (Update.end()) {
+                            if (Update.isFinished()) {
+                                Serial.println("OTA Update successful. Rebooting...");
+                                preferences.begin("ota", false);
+                                preferences.putString("last_url", firmwareUrl);
+                                preferences.end();
+                                lastFirmwareUrl = firmwareUrl;
+                                http.end();
+                                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                                ESP.restart();
+                            } else {
+                                Serial.println("OTA Update not finished properly.");
+                            }
+                        } else {
+                            Serial.printf("Update failed: %s\n", Update.errorString());
+                        }
+                    } else {
+                        Serial.println("Not enough space to begin OTA");
+                    }
+                } else {
+                    Serial.println("Content length is not correct");
+                }
+            } else {
+                Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+            }
+            http.end();
+        } else {
+            Serial.println("Firmware URLs are the same. Skipping OTA update.");
+        }
+
+        vTaskDelay(10000 / portTICK_PERIOD_MS); 
+    }
+}
+
 
 void taskThingsBoardLoop(void *pvParameters) {
     while (1) {
@@ -718,6 +836,11 @@ void setup() {
     MQ2.init();
     calibrateSensorMQ2();
 
+    preferences.begin("ota", true); // true for read-only mode
+    lastFirmwareUrl = preferences.getString("last_url", "");
+    preferences.end();
+
+
     xTaskCreate(taskWiFiConnect, "WiFiConnect", 4096, NULL, 1, NULL);
     xTaskCreate(taskCoreIOTConnect, "CoreIOTConnect", 4096, NULL, 1, NULL);
     xTaskCreate(taskBlinkLed, "BlinkLed", 4096, NULL, 1, NULL);
@@ -726,6 +849,7 @@ void setup() {
     xTaskCreate(taskAutoFanControl, "AutoFanControl", 4096, NULL, 1, NULL);
     xTaskCreate(taskReadButton, "ReadButton", 4096, NULL, 1, NULL);
     xTaskCreate(taskLCDDisplay, "LCDDisplay", 4096, NULL, 1, NULL);
+    xTaskCreate(taskOTAUpdate, "OTAUpdate", 8192, NULL, 1, NULL);
     xTaskCreate(taskThingsBoardLoop, "ThingsBoardLoop", 4096, NULL, 1, NULL);
 }
 

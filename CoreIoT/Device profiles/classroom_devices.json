@@ -11,7 +11,7 @@
   "provisionDeviceKey": null,
   "firmwareId": {
     "entityType": "OTA_PACKAGE",
-    "id": "9c348100-4085-11f0-8663-d7e1961e8cba"
+    "id": "b79d61c0-4088-11f0-8663-d7e1961e8cba"
   },
   "softwareId": null,
   "defaultEdgeRuleChainId": null,
